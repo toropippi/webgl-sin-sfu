@@ -1,2 +1,9 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+*.data binary
+*.wasm binary
+*.symbols.json binary
+*.png binary
+*.jpg binary
+*.ogg binary
+*.mp4 binary
+*.bundle binary
+*.bundle.meta text eol=lf
