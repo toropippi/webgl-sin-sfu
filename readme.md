@@ -8,7 +8,7 @@ GPU上で実行するsin() cos()関数には近似版と高精度版がありま
 
 GitHub Pages からアクセスしてブラウザで実行できます：
 
-👉 **[Live Demo](https://toropippi.github.io/webgl-sin-sfu-test/)**
+👉 **[Live Demo](https://toropippi.github.io/webgl-sin-sfu/)**
 
 対応ブラウザ：Chrome / Edge / Firefox / Safari  
 （WebGL 2.0 対応必須）
