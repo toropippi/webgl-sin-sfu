@@ -1,0 +1,15 @@
+# Unity default
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uilds?/
+[Ll]ogs/
+[Mm]emoryCaptures/
+UserSettings/
+
+# ただし docs/ は除外しない（公開に必要）
+!/docs/
+
+# OS/editor
+.DS_Store
+.vscode/
