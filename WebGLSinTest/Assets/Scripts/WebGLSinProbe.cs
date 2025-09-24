@@ -19,31 +19,51 @@ public class WebGLSinProbe : MonoBehaviour
     float[] inputs = new float[N];
     uint[] inputHex = new uint[N];
 
-    // 表描画
+    // 画面描画
     Vector2 scroll = Vector2.zero;
     GUIStyle labelStyle = null, headerStyle = null, cellStyle = null;
 
     // 行データ
-    struct Row { public string idx, inDec, inHex, sinDec, sinHex, vendor; }
+    struct Row
+    {
+        public string idx, inDec, inHex, sinDec, sinHex, vendor, correctHex, ulp;
+    }
     Row[] rows;
 
-    // 既知結果（TSVをコード化）
+    // === 参照（ベンダ別） ===
     class RefRow
     {
-        public string arg_hex;                 // 0x???????? （入力ビット列）
-        public string sin_hex_amd;             // gfx1036
-        public string sin_hex_intel;           // Intel UHD770
-        public string sin_hex_nvidia;          // RTX5090
+        public string arg_hex;
+        public string sin_hex_amd;
+        public string sin_hex_intel;
+        public string sin_hex_nvidia;
     }
     Dictionary<string, RefRow> refsByHex;
+
+    // === 正解（高精度） ===
+    Dictionary<string, string> correctHexByArgHex;
 
     static float UIntToFloat(uint bits) => BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
     static uint FloatToUInt(float v) => BitConverter.ToUInt32(BitConverter.GetBytes(v), 0);
 
+    // ULP 距離（IEEE754 並べ替え）
+    static int UlpDistance(uint a, uint b)
+    {
+        int ia = (int)a;
+        int ib = (int)b;
+        // 並べ替え：負は大きく、正は小さくならないよう単調化
+        ia = (ia < 0) ? int.MinValue - ia : ia + int.MinValue;
+        ib = (ib < 0) ? int.MinValue - ib : ib + int.MinValue;
+        long d = (long)ia - ib;
+        if (d < 0) d = -d;
+        if (d > int.MaxValue) return int.MaxValue;
+        return (int)d;
+    }
+
     string overallVendorGuess = "";
     string runtimeInfoLine = "";
 
-    // ====== 参照テーブル（最新版 table2） ======
+    // ====== 参照テーブル（ベンダ別：最新版 table2） ======
     void BuildReference()
     {
         var list = new List<RefRow>
@@ -60,6 +80,20 @@ public class WebGLSinProbe : MonoBehaviour
         };
         refsByHex = new Dictionary<string, RefRow>(StringComparer.OrdinalIgnoreCase);
         foreach (var r in list) refsByHex[r.arg_hex] = r;
+
+        // ====== 正解（高精度） hex ======
+        correctHexByArgHex = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "0x00000100", "0x00000100" },
+            { "0x007FFFFF", "0x007FFFFF" },
+            { "0x807FFFFF", "0x807FFFFF" },
+            { "0x80000000", "0x80000000" }, // -0.0
+            { "0x00000000", "0x00000000" },
+            { "0x3900F990", "0x3900F990" },
+            { "0x40490FF1", "0xB6B2EEF5" }, // -5.33e-06
+            { "0xC015C28F", "0xBF37ED50" }, // -0.7184648514
+            { "0x47DFA900", "0x3E453A34" }, // 0.1926048398
+        };
     }
 
     string DetectVendor(string inHex, string outHex)
@@ -82,7 +116,7 @@ public class WebGLSinProbe : MonoBehaviour
 
         BuildReference();
 
-        // 入力 9 個（順序は依頼どおり）
+        // 入力 9 個（順序固定）
         uint[] bitPatterns = { 0x00000100u, 0x007FFFFFu, 0x807FFFFFu, 0x80000000u, 0x00000000u };
         float[] decimals = { 0.0001230000052601099f, 3.1415979862213135f, -2.3399999141693115f, 114514.0f };
 
@@ -90,7 +124,7 @@ public class WebGLSinProbe : MonoBehaviour
         foreach (var b in bitPatterns) { var f = UIntToFloat(b); inputs[idx] = f; inputHex[idx] = b; idx++; }
         foreach (var d in decimals) { inputs[idx] = d; inputHex[idx] = FloatToUInt(d); idx++; }
 
-        // マテリアル／RT 準備（常に ARGB32：1bit/px なので十分）
+        // マテリアル／RT
         mat = new Material(shader);
 
         rt = new RenderTexture(BIT_W, BIT_H, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
@@ -116,17 +150,16 @@ public class WebGLSinProbe : MonoBehaviour
         readTex.Apply(false);
         RenderTexture.active = prev;
 
-        // ========= 32x9 の 1bit/px を復元して行データを作る =========
+        // 復元＆行データ作成
         rows = new Row[N];
-        var px = readTex.GetPixels(); // 長さ 32*9
+        var px = readTex.GetPixels(); // len = 32*9
 
-        for (int row = 0; row < N; ++row) // row = 0(bottom) .. 8(top)
+        for (int row = 0; row < N; ++row)
         {
             uint bits = 0u;
-            int y = row; // シェーダと同じ行番号（下→上）
+            int y = row;
             for (int x = 0; x < 32; ++x)
             {
-                // GetPixels は (x + y*width) の順。R が 0 または 1。
                 float r = px[y * BIT_W + x].r;
                 if (r > 0.5f) bits |= (1u << x);
             }
@@ -138,6 +171,16 @@ public class WebGLSinProbe : MonoBehaviour
             string outHex = "0x" + bits.ToString("X8");
             string vendor = DetectVendor(inHexS, outHex);
 
+            // 正解＆ULP
+            string correctHex = correctHexByArgHex.TryGetValue(inHexS, out var ch) ? ch : "";
+            string ulpStr = "";
+            if (!string.IsNullOrEmpty(correctHex))
+            {
+                uint correctBits = Convert.ToUInt32(correctHex.Substring(2), 16);
+                int ulp = UlpDistance(bits, correctBits);
+                ulpStr = ulp.ToString(CultureInfo.InvariantCulture);
+            }
+
             rows[row] = new Row
             {
                 idx = row.ToString(),
@@ -145,11 +188,13 @@ public class WebGLSinProbe : MonoBehaviour
                 inHex = inHexS,
                 sinDec = outDec,
                 sinHex = outHex,
-                vendor = vendor
+                vendor = vendor,
+                correctHex = correctHex,
+                ulp = ulpStr
             };
         }
 
-        // 総合推定：参照のある行がすべて同じベンダーなら Overall を出す
+        // 総合推定
         {
             string v = null; bool consistent = true; int counted = 0;
             foreach (var r in rows)
@@ -168,17 +213,18 @@ public class WebGLSinProbe : MonoBehaviour
             overallVendorGuess = (consistent && counted > 0) ? v : "";
         }
 
-        // Console にも出す
+        // Console 出力
         var sb = new StringBuilder();
         sb.AppendLine("WebGL sin() bitplane probe (32x9, 1bit/px, ARGB32)");
         sb.AppendLine(runtimeInfoLine);
-        sb.AppendLine(string.Format("{0,-3} | {1,14} | {2,12} | {3,14} | {4,12} | {5}",
-            "idx", "in_dec", "in_hex", "sin_dec", "sin_hex", "vendor"));
-        sb.AppendLine(new string('-', 92));
+        sb.AppendLine(string.Format("{0,-3} | {1,14} | {2,12} | {3,14} | {4,12} | {5,12} | {6,10}",
+            "idx", "in_dec", "in_hex", "sin_dec", "sin_hex", "correct_hex", "ulp_error"));
+        sb.AppendLine(new string('-', 110));
         foreach (var r in rows)
-            sb.AppendFormat("{0,-3} | {1,14} | {2,12} | {3,14} | {4,12} | {5}\n",
-                r.idx, r.inDec, r.inHex, r.sinDec, r.sinHex, string.IsNullOrEmpty(r.vendor) ? "" : r.vendor);
-        sb.AppendLine(new string('-', 92));
+            sb.AppendFormat("{0,-3} | {1,14} | {2,12} | {3,14} | {4,12} | {5,12} | {6,10}  {7}\n",
+                r.idx, r.inDec, r.inHex, r.sinDec, r.sinHex, r.correctHex, r.ulp,
+                string.IsNullOrEmpty(r.vendor) ? "" : ("[" + r.vendor + "]"));
+        sb.AppendLine(new string('-', 110));
         sb.AppendLine("Overall vendor guess: " + (string.IsNullOrEmpty(overallVendorGuess) ? "(unknown)" : overallVendorGuess));
         Debug.Log(sb.ToString());
     }
@@ -192,7 +238,7 @@ public class WebGLSinProbe : MonoBehaviour
             cellStyle = new GUIStyle(labelStyle) { clipping = TextClipping.Clip };
         }
 
-        // ビットプレーン（32x9）プレビュー
+        // ビットプレーン・プレビュー
         if (rt != null) GUI.DrawTexture(new Rect(10, 10, 256, 72), rt, ScaleMode.StretchToFill, false);
 
         float pad = 10f;
@@ -204,7 +250,7 @@ public class WebGLSinProbe : MonoBehaviour
         GUILayout.Space(6);
 
         // 列幅
-        float wIdx = 40f, wInDec = 220f, wInHex = 140f, wSinDec = 220f, wSinHex = 160f, wVendor = 160f;
+        float wIdx = 40f, wInDec = 200f, wInHex = 140f, wSinDec = 200f, wSinHex = 150f, wCorrect = 150f, wUlp = 90f, wMatch = 120f;
         float rowH = 22f;
 
         using (new GUILayout.HorizontalScope())
@@ -214,7 +260,9 @@ public class WebGLSinProbe : MonoBehaviour
             GUILayout.Label("in_hex", headerStyle, GUILayout.Width(wInHex), GUILayout.Height(rowH));
             GUILayout.Label("sin_dec", headerStyle, GUILayout.Width(wSinDec), GUILayout.Height(rowH));
             GUILayout.Label("sin_hex", headerStyle, GUILayout.Width(wSinHex), GUILayout.Height(rowH));
-            GUILayout.Label("match (vendor)", headerStyle, GUILayout.Width(wVendor), GUILayout.Height(rowH));
+            GUILayout.Label("correct_hex", headerStyle, GUILayout.Width(wCorrect), GUILayout.Height(rowH));
+            GUILayout.Label("ULP error", headerStyle, GUILayout.Width(wUlp), GUILayout.Height(rowH));
+            GUILayout.Label("bitwise match", headerStyle, GUILayout.Width(wMatch), GUILayout.Height(rowH));
         }
         GUILayout.Box("", GUILayout.ExpandWidth(true), GUILayout.Height(1));
 
@@ -230,8 +278,11 @@ public class WebGLSinProbe : MonoBehaviour
                     GUILayout.Label(r.inHex, cellStyle, GUILayout.Width(wInHex), GUILayout.Height(rowH));
                     GUILayout.Label(r.sinDec, cellStyle, GUILayout.Width(wSinDec), GUILayout.Height(rowH));
                     GUILayout.Label(r.sinHex, cellStyle, GUILayout.Width(wSinHex), GUILayout.Height(rowH));
-                    GUILayout.Label(string.IsNullOrEmpty(r.vendor) ? "" : r.vendor,
-                                    cellStyle, GUILayout.Width(wVendor), GUILayout.Height(rowH));
+                    GUILayout.Label(r.correctHex, cellStyle, GUILayout.Width(wCorrect), GUILayout.Height(rowH));
+                    GUILayout.Label(string.IsNullOrEmpty(r.ulp) ? "" : r.ulp,
+                                    cellStyle, GUILayout.Width(wUlp), GUILayout.Height(rowH));
+                    GUILayout.Label(string.IsNullOrEmpty(r.vendor) ? "" : (r.vendor),
+                                    cellStyle, GUILayout.Width(wMatch), GUILayout.Height(rowH));
                 }
             }
         }
